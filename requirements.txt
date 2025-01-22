@@ -8,3 +8,4 @@ python-dotenv
 langchain_openai 
 streamlit
 spacy
+PyPDF2
