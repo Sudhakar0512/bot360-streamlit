@@ -10,6 +10,7 @@ streamlit
 spacy
 PyPDF2
 pinecone-client
-numpy>=1.26.0
+numpy==1.26.3
 spacy==3.7.2
+thinc==8.2.3
 https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.0/en_core_web_sm-3.7.0.tar.gz
