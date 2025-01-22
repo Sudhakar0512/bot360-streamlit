@@ -1,0 +1,132 @@
+
+
+# pdf_processor.py
+from typing import List, Dict
+import PyPDF2
+import nltk
+from nltk.tokenize import sent_tokenize
+import re
+
+class EnhancedPDFProcessor:
+    def __init__(self):
+        """Initialize the PDF processor with NLTK."""
+        # Download required NLTK data
+        try:
+            # Try to use the punkt tokenizer
+            nltk.data.find('tokenizers/punkt')
+        except LookupError:
+            # If not found, download it
+            try:
+                nltk.download('punkt', quiet=True)
+            except Exception as e:
+                # If download fails, create download directory and retry
+                import os
+                os.makedirs(os.path.expanduser('~/nltk_data'), exist_ok=True)
+                nltk.download('punkt', quiet=True)
+    
+    def extract_text_from_pdf(self, pdf_file) -> Dict[str, str]:
+        """Extract text content from PDF with metadata."""
+        try:
+            pdf_reader = PyPDF2.PdfReader(pdf_file)
+            pages = {}
+            
+            for idx, page in enumerate(pdf_reader.pages):
+                text = page.extract_text()
+                # Store page number for context preservation
+                pages[f"page_{idx + 1}"] = text
+                
+            return {
+                "text": "\n".join(pages.values()),
+                "metadata": {
+                    "page_count": len(pages),
+                    "pages": pages
+                }
+            }
+        except Exception as e:
+            raise Exception(f"Error extracting text from PDF: {str(e)}")
+
+    def _clean_text(self, text: str) -> str:
+        """Clean text by removing extra whitespace and special characters."""
+        # Remove extra whitespace
+        text = re.sub(r'\s+', ' ', text)
+        # Remove special characters but keep punctuation
+        text = re.sub(r'[^\w\s.,!?;:-]', '', text)
+        return text.strip()
+
+    def split_text_into_chunks(
+        self, 
+        text: str, 
+        chunk_size: int = 512,
+        overlap: int = 50,
+        respect_sentences: bool = True
+    ) -> List[Dict[str, str]]:
+        """
+        Split text into overlapping chunks while preserving sentence boundaries.
+        
+        Args:
+            text: Input text to split
+            chunk_size: Maximum size of each chunk
+            overlap: Number of words to overlap between chunks
+            respect_sentences: Whether to preserve sentence boundaries
+        """
+        try:
+            # Clean the text first
+            cleaned_text = self._clean_text(text)
+            
+            # Split into sentences if requested
+            if respect_sentences:
+                try:
+                    sentences = sent_tokenize(cleaned_text)
+                except Exception as e:
+                    # Fallback to simple splitting if sentence tokenization fails
+                    sentences = [s.strip() + '.' for s in cleaned_text.split('.') if s.strip()]
+            else:
+                sentences = [cleaned_text]
+            
+            chunks = []
+            current_chunk = []
+            current_size = 0
+            
+            for sentence in sentences:
+                sentence_words = sentence.split()
+                sentence_size = len(' '.join(sentence_words))
+                
+                if current_size + sentence_size > chunk_size:
+                    # Store current chunk if it's not empty
+                    if current_chunk:
+                        chunk_text = ' '.join(current_chunk)
+                        chunks.append({
+                            "text": chunk_text,
+                            "metadata": {
+                                "chunk_size": len(chunk_text),
+                                "word_count": len(current_chunk),
+                                "chunk_index": len(chunks)
+                            }
+                        })
+                    
+                    # Start new chunk with overlap
+                    if overlap > 0 and current_chunk:
+                        current_chunk = current_chunk[-overlap:]
+                        current_size = len(' '.join(current_chunk))
+                    else:
+                        current_chunk = []
+                        current_size = 0
+                
+                current_chunk.extend(sentence_words)
+                current_size += sentence_size + 1  # +1 for space
+            
+            # Add the last chunk if it exists
+            if current_chunk:
+                chunk_text = ' '.join(current_chunk)
+                chunks.append({
+                    "text": chunk_text,
+                    "metadata": {
+                        "chunk_size": len(chunk_text),
+                        "word_count": len(current_chunk),
+                        "chunk_index": len(chunks)
+                    }
+                })
+            
+            return chunks
+        except Exception as e:
+            raise Exception(f"Error splitting text into chunks: {str(e)}")

@@ -1,0 +1,1046 @@
+# import os
+# from dotenv import load_dotenv
+# from typing import Tuple, List
+# from langchain_core.runnables import (
+#     RunnableBranch,
+#     RunnableLambda,
+#     RunnableParallel,
+#     RunnablePassthrough,
+# )
+# # from langchain_community.graphs import Neo4jGraph
+# from langchain_neo4j import Neo4jGraph
+# from langchain_core.prompts import ChatPromptTemplate
+# from langchain_core.prompts.prompt import PromptTemplate
+# from langchain_core.messages import AIMessage, HumanMessage
+# from langchain_core.output_parsers import StrOutputParser
+# from langchain_community.vectorstores import Neo4jVector
+# # from langchain.document_loaders import WikipediaLoader
+# from langchain_community.document_loaders import WikipediaLoader
+
+# from langchain.text_splitter import TokenTextSplitter
+# from langchain_openai import ChatOpenAI
+# from langchain_experimental.graph_transformers import LLMGraphTransformer
+# # from langchain_core.pydantic_v1 import BaseModel, Field
+# # from pydantic import BaseModel
+# from pydantic import BaseModel, Field
+
+
+# from neo4j import GraphDatabase
+# from yfiles_jupyter_graphs import GraphWidget
+# from langchain_openai import OpenAIEmbeddings
+
+# # Load environment variables
+# load_dotenv()
+# OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# NEO4J_URI = os.getenv("NEO4J_URI")
+# NEO4J_USERNAME = os.getenv("NEO4J_USERNAME")
+# NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
+
+# # Initialize Neo4j graph
+# graph = Neo4jGraph()
+
+# # Load and split documents
+# raw_documents = WikipediaLoader(query="Law of Malaysia").load()
+# print(f"Loaded {len(raw_documents)} documents.")
+
+# text_splitter = TokenTextSplitter(chunk_size=512, chunk_overlap=24)
+# documents = text_splitter.split_documents(raw_documents[:3])
+
+# # Initialize LLM and transformer
+# llm = ChatOpenAI(temperature=0, model_name="gpt-3.5-turbo-0125")
+# llm_transformer = LLMGraphTransformer(llm=llm)
+
+# # Convert to graph documents and add to Neo4j
+# graph_documents = llm_transformer.convert_to_graph_documents(documents)
+# graph.add_graph_documents(
+#     graph_documents,
+#     baseEntityLabel=True,
+#     include_source=True
+# )
+
+# # Neo4j graph visualization
+# def showGraph(cypher: str = "MATCH (s)-[r:!MENTIONS]->(t) RETURN s,r,t LIMIT 50"):
+#     driver = GraphDatabase.driver(
+#         uri=NEO4J_URI,
+#         auth=(NEO4J_USERNAME, NEO4J_PASSWORD)
+#     )
+#     session = driver.session()
+#     widget = GraphWidget(graph=session.run(cypher).graph())
+#     widget.node_label_mapping = 'id'
+#     display(widget)
+#     return widget
+
+# # Set up vector index
+# vector_index = Neo4jVector.from_existing_graph(
+#     embeddings_model=OpenAIEmbeddings(),
+#     search_type="hybrid",
+#     node_label="Document",
+#     text_node_properties=["text"],
+#     embedding_node_property="embedding"
+# )
+
+# graph.query("CREATE FULLTEXT INDEX entity IF NOT EXISTS FOR (e:__Entity__) ON EACH [e.id]")
+
+# # Entity extraction class
+# class Entities(BaseModel):
+#     names: List[str] = Field(
+#         ...,
+#         description="All the person, organization, or business entities that appear in the text",
+#     )
+
+# # Prompt for entity extraction
+# entity_prompt = ChatPromptTemplate.from_messages([
+#     ("system", "You are extracting organization and person entities from the text."),
+#     ("human", "Use the given format to extract information from the following input: {question}")
+# ])
+# entity_chain = entity_prompt | llm.with_structured_output(Entities)
+
+# # Generate full text query
+# def generate_full_text_query(input: str) -> str:
+#     from langchain_community.vectorstores.neo4j_vector import remove_lucene_chars
+#     words = [el for el in remove_lucene_chars(input).split() if el]
+#     return " AND ".join([f"{word}~2" for word in words])
+
+# # Structured retriever
+# def structured_retriever(question: str) -> str:
+#     result = ""
+#     entities = entity_chain.invoke({"question": question})
+#     for entity in entities.names:
+#         query = generate_full_text_query(entity)
+#         response = graph.query(
+#             """CALL db.index.fulltext.queryNodes('entity', $query, {limit:2})
+#             YIELD node,score
+#             CALL {
+#               WITH node
+#               MATCH (node)-[r:!MENTIONS]->(neighbor)
+#               RETURN node.id + ' - ' + type(r) + ' -> ' + neighbor.id AS output
+#               UNION ALL
+#               WITH node
+#               MATCH (node)<-[r:!MENTIONS]-(neighbor)
+#               RETURN neighbor.id + ' - ' + type(r) + ' -> ' + node.id AS output
+#             }
+#             RETURN output LIMIT 50
+#             """,
+#             {"query": query},
+#         )
+#         result += "\n".join([el['output'] for el in response])
+#     return result
+
+# # Unified retriever
+# def retriever(question: str):
+#     print(f"Search query: {question}")
+#     structured_data = structured_retriever(question)
+#     unstructured_data = [el.page_content for el in vector_index.similarity_search(question)]
+#     final_data = f"""Structured data:
+# {structured_data}
+# Unstructured data:
+# {"#Document ".join(unstructured_data)}
+#     """
+#     return final_data
+
+# # Question answering
+# search_query = RunnableBranch(
+#     (
+#         RunnableLambda(lambda x: bool(x.get("chat_history"))),
+#         RunnablePassthrough.assign(chat_history=lambda x: _format_chat_history(x["chat_history"]))
+#         | CONDENSE_QUESTION_PROMPT
+#         | ChatOpenAI(temperature=0)
+#         | StrOutputParser(),
+#     ),
+#     RunnableLambda(lambda x: x["question"]),
+# )
+
+# answer_prompt = ChatPromptTemplate.from_template(
+#     """Answer the question based only on the following context:
+#     {context}
+#     Question: {question}
+#     Answer:"""
+# )
+
+# qa_chain = (
+#     RunnableParallel({
+#         "context": search_query | retriever,
+#         "question": RunnablePassthrough(),
+#     })
+#     | answer_prompt
+#     | llm
+#     | StrOutputParser()
+# )
+
+# # Example usage
+# if __name__ == "__main__":
+#     question = "What is Law of Malaysia?"
+#     print(qa_chain.invoke({"question": question}))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+---streamlit
+
+import os
+import streamlit as st
+from dotenv import load_dotenv
+from typing import Tuple, List
+from langchain_core.runnables import (
+    RunnableBranch,
+    RunnableLambda,
+    RunnableParallel,
+    RunnablePassthrough,
+)
+from langchain_neo4j import Neo4jGraph
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_community.vectorstores import Neo4jVector
+from langchain_community.document_loaders import WikipediaLoader
+from langchain.text_splitter import TokenTextSplitter
+from langchain_openai import ChatOpenAI
+from langchain_experimental.graph_transformers import LLMGraphTransformer
+from pydantic import BaseModel, Field
+from neo4j import GraphDatabase
+from langchain_openai import OpenAIEmbeddings
+
+# Load environment variables
+load_dotenv()
+
+# Initialize session state
+if 'chat_history' not in st.session_state:
+    st.session_state.chat_history = []
+
+class Entities(BaseModel):
+    names: List[str] = Field(
+        ...,
+        description="All the person, organization, or business entities that appear in the text",
+    )
+
+def initialize_components():
+    """Initialize all necessary components for the RAG system"""
+    # Get credentials from environment variables
+    neo4j_url = os.getenv("NEO4J_URI")
+    neo4j_username = os.getenv("NEO4J_USERNAME")
+    neo4j_password = os.getenv("NEO4J_PASSWORD")
+
+    # Initialize Neo4j graph
+    graph = Neo4jGraph(
+        url=neo4j_url,
+        username=neo4j_username,
+        password=neo4j_password
+    )
+    
+    # Initialize LLM
+    llm = ChatOpenAI(temperature=0, model_name="gpt-3.5-turbo-0125")
+    
+    # Initialize embeddings model
+    embeddings = OpenAIEmbeddings()
+    
+    vector_index = Neo4jVector.from_existing_graph(
+    OpenAIEmbeddings(),
+    search_type="hybrid",
+    node_label="Document",
+    text_node_properties=["text"],
+    embedding_node_property="embedding"
+)
+
+    # Set up vector index
+    # vector_index = Neo4jVector(
+    #     url=neo4j_url,
+    #     username=neo4j_username,
+    #     password=neo4j_password,
+    #     embeddings=embeddings,
+    #     node_label="Document",
+    #     text_node_property="text",
+    #     embedding_node_property="embedding",
+    #     embedding_size=1536  # Size for OpenAI embeddings
+    # )
+    
+    return graph, llm, vector_index
+
+def load_and_process_documents(query: str, graph: Neo4jGraph, vector_index: Neo4jVector):
+    """Load and process documents from Wikipedia"""
+    raw_documents = WikipediaLoader(query=query).load()
+    text_splitter = TokenTextSplitter(chunk_size=512, chunk_overlap=24)
+    documents = text_splitter.split_documents(raw_documents[:3])
+    
+    llm = ChatOpenAI(temperature=0, model_name="gpt-3.5-turbo-0125")
+    llm_transformer = LLMGraphTransformer(llm=llm)
+    graph_documents = llm_transformer.convert_to_graph_documents(documents)
+    
+    # Add documents to both graph and vector store
+    graph.add_graph_documents(
+        graph_documents,
+        baseEntityLabel=True,
+        include_source=True
+    )
+    
+    # Add to vector store
+    vector_index.add_documents(documents)
+    
+    return len(documents)
+
+def generate_full_text_query(input: str) -> str:
+    """Generate full text query for Neo4j"""
+    from langchain_community.vectorstores.neo4j_vector import remove_lucene_chars
+    words = [el for el in remove_lucene_chars(input).split() if el]
+    return " AND ".join([f"{word}~2" for word in words])
+
+def structured_retriever(question: str, graph: Neo4jGraph, llm: ChatOpenAI) -> str:
+    """Retrieve structured data from Neo4j"""
+    entity_prompt = ChatPromptTemplate.from_messages([
+        ("system", "You are extracting organization and person entities from the text."),
+        ("human", "Use the given format to extract information from the following input: {question}")
+    ])
+    entity_chain = entity_prompt | llm.with_structured_output(Entities)
+    
+    result = ""
+    entities = entity_chain.invoke({"question": question})
+    for entity in entities.names:
+        query = generate_full_text_query(entity)
+        response = graph.query(
+            """CALL db.index.fulltext.queryNodes('entity', $query, {limit:2})
+            YIELD node,score
+            CALL {
+              WITH node
+              MATCH (node)-[r:!MENTIONS]->(neighbor)
+              RETURN node.id + ' - ' + type(r) + ' -> ' + neighbor.id AS output
+              UNION ALL
+              WITH node
+              MATCH (node)<-[r:!MENTIONS]-(neighbor)
+              RETURN neighbor.id + ' - ' + type(r) + ' -> ' + node.id AS output
+            }
+            RETURN output LIMIT 50
+            """,
+            {"query": query},
+        )
+        result += "\n".join([el['output'] for el in response])
+    return result
+
+def retriever(question: str, graph: Neo4jGraph, vector_index: Neo4jVector, llm: ChatOpenAI):
+    """Combined retriever for both structured and unstructured data"""
+    structured_data = structured_retriever(question, graph, llm)
+    unstructured_data = [el.page_content for el in vector_index.similarity_search(question)]
+    final_data = f"""Structured data:
+{structured_data}
+Unstructured data:
+{"#Document ".join(unstructured_data)}
+    """
+    return final_data
+
+def setup_qa_chain(llm: ChatOpenAI, graph: Neo4jGraph, vector_index: Neo4jVector):
+    """Set up the question-answering chain"""
+    answer_prompt = ChatPromptTemplate.from_template(
+        """Answer the question based only on the following context:
+        {context}
+        Question: {question}
+        Answer:"""
+    )
+
+    qa_chain = (
+        RunnableParallel({
+            "context": lambda x: retriever(x["question"], graph, vector_index, llm),
+            "question": RunnablePassthrough(),
+        })
+        | answer_prompt
+        | llm
+        | StrOutputParser()
+    )
+    
+    return qa_chain
+
+def main():
+    st.set_page_config(page_title="RAG Q&A System", layout="wide")
+    
+    st.title("📚 RAG Q&A System with Neo4j")
+    
+    try:
+        # Initialize components
+        graph, llm, vector_index = initialize_components()
+        qa_chain = setup_qa_chain(llm, graph, vector_index)
+        
+        # Sidebar for document loading
+        with st.sidebar:
+            st.header("Load Documents")
+            wiki_query = st.text_input("Enter Wikipedia topic to load:", value="Law of Malaysia")
+            if st.button("Load Documents"):
+                with st.spinner("Loading and processing documents..."):
+                    try:
+                        num_docs = load_and_process_documents(wiki_query, graph, vector_index)
+                        st.success(f"Successfully loaded and processed {num_docs} documents about {wiki_query}")
+                    except Exception as e:
+                        st.error(f"Error loading documents: {str(e)}")
+        
+        # Main chat interface
+        st.header("Ask Questions")
+        
+        # Display chat history
+        for message in st.session_state.chat_history:
+            with st.chat_message(message["role"]):
+                st.write(message["content"])
+        
+        # Chat input
+        if question := st.chat_input("Ask a question about the loaded documents"):
+            # Display user question
+            with st.chat_message("user"):
+                st.write(question)
+            
+            # Add user message to chat history
+            st.session_state.chat_history.append({"role": "user", "content": question})
+            
+            # Generate and display response
+            with st.chat_message("assistant"):
+                with st.spinner("Thinking..."):
+                    try:
+                        response = qa_chain.invoke({"question": question})
+                        st.write(response)
+                        # Add assistant response to chat history
+                        st.session_state.chat_history.append({"role": "assistant", "content": response})
+                    except Exception as e:
+                        st.error(f"Error generating response: {str(e)}")
+    
+    except Exception as e:
+        st.error(f"Error initializing components: {str(e)}")
+        st.error("Please make sure your environment variables are set correctly and Neo4j is running.")
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+--PDF
+
+import os
+import streamlit as st
+from dotenv import load_dotenv
+from typing import Tuple, List
+import PyPDF2
+import tempfile
+from langchain_core.runnables import (
+    RunnableBranch,
+    RunnableLambda,
+    RunnableParallel,
+    RunnablePassthrough,
+)
+from langchain_neo4j import Neo4jGraph
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_community.vectorstores import Neo4jVector
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_openai import ChatOpenAI
+from langchain_experimental.graph_transformers import LLMGraphTransformer
+from pydantic import BaseModel, Field
+from neo4j import GraphDatabase
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.document_loaders import PyPDFLoader
+from langchain.docstore.document import Document
+
+# Load environment variables
+load_dotenv()
+
+# Initialize session state
+if 'chat_history' not in st.session_state:
+    st.session_state.chat_history = []
+if 'processed_files' not in st.session_state:
+    st.session_state.processed_files = set()
+
+class Entities(BaseModel):
+    names: List[str] = Field(
+        ...,
+        description="All the person, organization, or business entities that appear in the text",
+    )
+
+def initialize_components():
+    """Initialize all necessary components for the RAG system"""
+    # Get credentials from environment variables
+    neo4j_url = os.getenv("NEO4J_URI")
+    neo4j_username = os.getenv("NEO4J_USERNAME")
+    neo4j_password = os.getenv("NEO4J_PASSWORD")
+
+    # Initialize Neo4j graph
+    graph = Neo4jGraph(
+        url=neo4j_url,
+        username=neo4j_username,
+        password=neo4j_password
+    )
+    
+    # Initialize LLM
+    llm = ChatOpenAI(temperature=0, model_name="gpt-3.5-turbo-0125")
+    
+    # Initialize embeddings model
+    embeddings = OpenAIEmbeddings()
+    
+    # Set up vector index
+    vector_index = Neo4jVector.from_existing_graph(
+        embeddings,
+        search_type="hybrid",
+        node_label="Document",
+        text_node_properties=["text"],
+        embedding_node_property="embedding"
+    )
+    
+    return graph, llm, vector_index
+
+def process_pdf_file(uploaded_file, graph: Neo4jGraph, vector_index: Neo4jVector):
+    """Process uploaded PDF file and store in Neo4j"""
+    # Create a temporary file to save the uploaded file
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+        tmp_file.write(uploaded_file.getvalue())
+        tmp_file_path = tmp_file.name
+
+    try:
+        # Load PDF using PyPDFLoader
+        loader = PyPDFLoader(tmp_file_path)
+        pages = loader.load()
+
+        # Create text splitter
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200,
+            separators=["\n\n", "\n", ".", "!", "?", ",", " ", ""],
+            length_function=len
+        )
+
+        # Split documents into chunks
+        chunks = text_splitter.split_documents(pages)
+
+        # Add metadata to chunks
+        for i, chunk in enumerate(chunks):
+            chunk.metadata.update({
+                "source": uploaded_file.name,
+                "chunk_id": i,
+                "file_type": "pdf"
+            })
+
+        # Initialize LLM and transformer
+        llm = ChatOpenAI(temperature=0, model_name="gpt-3.5-turbo-0125")
+        llm_transformer = LLMGraphTransformer(llm=llm)
+        
+        # Convert to graph documents
+        graph_documents = llm_transformer.convert_to_graph_documents(chunks)
+        
+        # Add to Neo4j graph
+        graph.add_graph_documents(
+            graph_documents,
+            baseEntityLabel=True,
+            include_source=True
+        )
+        
+        # Add to vector store
+        vector_index.add_documents(chunks)
+
+        # Cleanup temporary file
+        os.unlink(tmp_file_path)
+        
+        return len(chunks)
+
+    except Exception as e:
+        if os.path.exists(tmp_file_path):
+            os.unlink(tmp_file_path)
+        raise e
+
+def structured_retriever(question: str, graph: Neo4jGraph, llm: ChatOpenAI) -> str:
+    """Retrieve structured data from Neo4j using regular pattern matching"""
+    entity_prompt = ChatPromptTemplate.from_messages([
+        ("system", "You are extracting organization and person entities from the text."),
+        ("human", "Use the given format to extract information from the following input: {question}")
+    ])
+    entity_chain = entity_prompt | llm.with_structured_output(Entities)
+    
+    result = ""
+    entities = entity_chain.invoke({"question": question})
+    
+    for entity in entities.names:
+        # Use CONTAINS for case-sensitive pattern matching
+        response = graph.query(
+            """
+            MATCH (n)
+            WHERE (n:Person OR n:Organization OR n:Document) 
+            AND (n.name CONTAINS $entity OR n.text CONTAINS $entity OR n.id CONTAINS $entity)
+            WITH n LIMIT 2
+            CALL {
+              WITH n
+              MATCH (n)-[r]->(neighbor)
+              RETURN n.id + ' - ' + type(r) + ' -> ' + neighbor.id AS output
+              UNION ALL
+              WITH n
+              MATCH (n)<-[r]-(neighbor)
+              RETURN neighbor.id + ' - ' + type(r) + ' -> ' + n.id AS output
+            }
+            RETURN DISTINCT output
+            LIMIT 50
+            """,
+            {"entity": entity},
+        )
+        result += "\n".join([el['output'] for el in response])
+        
+    return result
+
+def retriever(question: str, graph: Neo4jGraph, vector_index: Neo4jVector, llm: ChatOpenAI):
+    """Combined retriever for both structured and unstructured data"""
+    structured_data = structured_retriever(question, graph, llm)
+    unstructured_data = [el.page_content for el in vector_index.similarity_search(question)]
+    final_data = f"""Structured data:
+{structured_data}
+Unstructured data:
+{"#Document ".join(unstructured_data)}
+    """
+    return final_data
+
+def setup_qa_chain(llm: ChatOpenAI, graph: Neo4jGraph, vector_index: Neo4jVector):
+    """Set up the question-answering chain"""
+    answer_prompt = ChatPromptTemplate.from_template(
+        """Answer the question based only on the following context:
+        {context}
+        Question: {question}
+        Answer:"""
+    )
+
+    qa_chain = (
+        RunnableParallel({
+            "context": lambda x: retriever(x["question"], graph, vector_index, llm),
+            "question": RunnablePassthrough(),
+        })
+        | answer_prompt
+        | llm
+        | StrOutputParser()
+    )
+    
+    return qa_chain
+
+def main():
+    st.set_page_config(page_title="PDF RAG Q&A System", layout="wide")
+    
+    st.title("📚 PDF RAG Q&A System with Neo4j")
+    
+    try:
+        # Initialize components
+        graph, llm, vector_index = initialize_components()
+        qa_chain = setup_qa_chain(llm, graph, vector_index)
+        
+        # Sidebar for document loading
+        with st.sidebar:
+            st.header("Upload PDF Documents")
+            uploaded_files = st.file_uploader(
+                "Choose PDF files", 
+                type=['pdf'],
+                accept_multiple_files=True
+            )
+            
+            if uploaded_files:
+                for uploaded_file in uploaded_files:
+                    # Check if file has already been processed
+                    if uploaded_file.name not in st.session_state.processed_files:
+                        with st.spinner(f"Processing {uploaded_file.name}..."):
+                            try:
+                                num_chunks = process_pdf_file(uploaded_file, graph, vector_index)
+                                st.success(f"Successfully processed {uploaded_file.name} into {num_chunks} chunks")
+                                st.session_state.processed_files.add(uploaded_file.name)
+                            except Exception as e:
+                                st.error(f"Error processing {uploaded_file.name}: {str(e)}")
+            
+            # Display processed files
+            if st.session_state.processed_files:
+                st.header("Processed Files")
+                for file in st.session_state.processed_files:
+                    st.text(f"✓ {file}")
+        
+        # Main chat interface
+        st.header("Ask Questions")
+        
+        # Display chat history
+        for message in st.session_state.chat_history:
+            with st.chat_message(message["role"]):
+                st.write(message["content"])
+        
+        # Chat input
+        if question := st.chat_input("Ask a question about the uploaded documents"):
+            # Display user question
+            with st.chat_message("user"):
+                st.write(question)
+            
+            # Add user message to chat history
+            st.session_state.chat_history.append({"role": "user", "content": question})
+            
+            # Generate and display response
+            with st.chat_message("assistant"):
+                with st.spinner("Thinking..."):
+                    try:
+                        response = qa_chain.invoke({"question": question})
+                        st.write(response)
+                        # Add assistant response to chat history
+                        st.session_state.chat_history.append({"role": "assistant", "content": response})
+                    except Exception as e:
+                        st.error(f"Error generating response: {str(e)}")
+    
+    except Exception as e:
+        st.error(f"Error initializing components: {str(e)}")
+        st.error("Please make sure your environment variables are set correctly and Neo4j is running.")
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+
+
+
+------- Effieient Code ------------------
+
+import os
+import streamlit as st
+from dotenv import load_dotenv
+from typing import Tuple, List, Dict
+import PyPDF2
+import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+from queue import Queue
+import time
+from tqdm import tqdm
+from langchain_core.runnables import (
+    RunnableBranch,
+    RunnableLambda,
+    RunnableParallel,
+    RunnablePassthrough,
+)
+from langchain_neo4j import Neo4jGraph
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_community.vectorstores import Neo4jVector
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_openai import ChatOpenAI
+from langchain_experimental.graph_transformers import LLMGraphTransformer
+from pydantic import BaseModel, Field
+from neo4j import GraphDatabase
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.document_loaders import PyPDFLoader
+from langchain.docstore.document import Document
+
+# Load environment variables
+load_dotenv()
+
+# Constants for optimization
+CHUNK_SIZE = 1500
+CHUNK_OVERLAP = 150
+BATCH_SIZE = 50
+MAX_WORKERS = 4
+
+# Initialize session state
+if 'chat_history' not in st.session_state:
+    st.session_state.chat_history = []
+if 'processed_files' not in st.session_state:
+    st.session_state.processed_files = set()
+if 'processing_progress' not in st.session_state:
+    st.session_state.processing_progress = 0
+
+class Entities(BaseModel):
+    names: List[str] = Field(
+        ...,
+        description="All the person, organization, or business entities that appear in the text",
+    )
+
+class ProcessingManager:
+    def __init__(self):
+        self.progress = 0
+        self.total = 0
+        self.lock = threading.Lock()
+        
+    def update_progress(self, increment=1):
+        with self.lock:
+            self.progress += increment
+            if st.session_state is not None:
+                st.session_state.processing_progress = (self.progress / self.total) * 100
+
+def initialize_components():
+    """Initialize all necessary components for the RAG system"""
+    neo4j_url = os.getenv("NEO4J_URI")
+    neo4j_username = os.getenv("NEO4J_USERNAME")
+    neo4j_password = os.getenv("NEO4J_PASSWORD")
+
+    graph = Neo4jGraph(
+        url=neo4j_url,
+        username=neo4j_username,
+        password=neo4j_password,
+        database="neo4j"
+    )
+    
+    llm = ChatOpenAI(
+        temperature=0,
+        model_name="gpt-4o-mini",
+        max_tokens=2000
+    )
+    
+    embeddings = OpenAIEmbeddings(
+        chunk_size=BATCH_SIZE
+    )
+    
+    vector_index = Neo4jVector.from_existing_graph(
+        embeddings,
+        search_type="hybrid",
+        node_label="Document",
+        text_node_properties=["text"],
+        embedding_node_property="embedding"
+    )
+    
+    return graph, llm, vector_index
+
+def extract_text_from_pdf(pdf_path: str, filename: str) -> List[Document]:
+    """Extract text from PDF and return as Document objects with metadata"""
+    documents = []
+    with open(pdf_path, 'rb') as file:
+        reader = PyPDF2.PdfReader(file)
+        for page_num, page in enumerate(reader.pages):
+            text = page.extract_text()
+            if text.strip():
+                # Create Document object with metadata
+                doc = Document(
+                    page_content=text,
+                    metadata={
+                        "source": filename,
+                        "page": page_num + 1,
+                        "file_type": "pdf"
+                    }
+                )
+                documents.append(doc)
+    return documents
+
+def process_chunk_batch(chunks: List[Document], graph: Neo4jGraph, vector_index: Neo4jVector, 
+                       processing_manager: ProcessingManager):
+    """Process a batch of chunks in parallel"""
+    try:
+        # Convert chunks to graph documents
+        llm = ChatOpenAI(temperature=0, model_name="gpt-3.5-turbo-0125")
+        llm_transformer = LLMGraphTransformer(llm=llm)
+        graph_documents = llm_transformer.convert_to_graph_documents(chunks)
+        
+        # Add to Neo4j graph
+        graph.add_graph_documents(
+            graph_documents,
+            baseEntityLabel=True,
+            include_source=True
+        )
+        
+        # Add to vector store
+        vector_index.add_documents(chunks)
+        
+        # Update progress
+        processing_manager.update_progress(len(chunks))
+        
+    except Exception as e:
+        st.error(f"Error processing batch: {str(e)}")
+        raise e
+
+def process_pdf_file(uploaded_file, graph: Neo4jGraph, vector_index: Neo4jVector):
+    """Process uploaded PDF file with parallel processing and progress tracking"""
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+        tmp_file.write(uploaded_file.getvalue())
+        tmp_file_path = tmp_file.name
+
+    try:
+        # Extract text from PDF with metadata
+        documents = extract_text_from_pdf(tmp_file_path, uploaded_file.name)
+        
+        # Create text splitter with optimized parameters
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=CHUNK_SIZE,
+            chunk_overlap=CHUNK_OVERLAP,
+            separators=["\n\n", "\n", ".", "!", "?", ",", " ", ""],
+            length_function=len
+        )
+
+        # Split documents into chunks while preserving metadata
+        chunks = text_splitter.split_documents(documents)
+
+        # Update chunk IDs while preserving other metadata
+        for i, chunk in enumerate(chunks):
+            chunk.metadata["chunk_id"] = i
+
+        # Initialize processing manager
+        processing_manager = ProcessingManager()
+        processing_manager.total = len(chunks)
+
+        # Process chunks in batches using ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = []
+            for i in range(0, len(chunks), BATCH_SIZE):
+                batch = chunks[i:i + BATCH_SIZE]
+                future = executor.submit(
+                    process_chunk_batch, 
+                    batch, 
+                    graph, 
+                    vector_index,
+                    processing_manager
+                )
+                futures.append(future)
+
+            # Wait for all futures to complete
+            for future in as_completed(futures):
+                future.result()
+
+        # Cleanup
+        os.unlink(tmp_file_path)
+        return len(chunks)
+
+    except Exception as e:
+        if os.path.exists(tmp_file_path):
+            os.unlink(tmp_file_path)
+        raise e
+
+def retriever(question: str, graph: Neo4jGraph, vector_index: Neo4jVector, llm: ChatOpenAI):
+    """Combined retriever for both structured and unstructured data"""
+    entity_prompt = ChatPromptTemplate.from_messages([
+        ("system", "You are extracting organization and person entities from the text."),
+        ("human", "Use the given format to extract information from the following input: {question}")
+    ])
+    entity_chain = entity_prompt | llm.with_structured_output(Entities)
+    
+    result = ""
+    entities = entity_chain.invoke({"question": question})
+    
+    for entity in entities.names:
+        response = graph.query(
+            """
+            MATCH (n)
+            WHERE (n:Person OR n:Organization OR n:Document) 
+            AND (n.name CONTAINS $entity OR n.text CONTAINS $entity OR n.id CONTAINS $entity)
+            WITH n LIMIT 2
+            CALL {
+              WITH n
+              MATCH (n)-[r]->(neighbor)
+              RETURN n.id + ' - ' + type(r) + ' -> ' + neighbor.id AS output
+              UNION ALL
+              WITH n
+              MATCH (n)<-[r]-(neighbor)
+              RETURN neighbor.id + ' - ' + type(r) + ' -> ' + n.id AS output
+            }
+            RETURN DISTINCT output
+            LIMIT 50
+            """,
+            {"entity": entity},
+        )
+        result += "\n".join([el['output'] for el in response])
+    
+    # Get relevant documents from vector store
+    similar_docs = vector_index.similarity_search(question)
+    unstructured_data = [doc.page_content for doc in similar_docs]
+    
+    final_data = f"""Structured data:
+{result}
+Unstructured data:
+{"#Document ".join(unstructured_data)}
+    """
+    return final_data
+
+def setup_qa_chain(llm: ChatOpenAI, graph: Neo4jGraph, vector_index: Neo4jVector):
+    """Set up the question-answering chain"""
+    answer_prompt = ChatPromptTemplate.from_template(
+        """Answer the question based only on the following context. Be concise and specific:
+        {context}
+        Question: {question}
+        Answer:"""
+    )
+
+    qa_chain = (
+        RunnableParallel({
+            "context": lambda x: retriever(x["question"], graph, vector_index, llm),
+            "question": RunnablePassthrough(),
+        })
+        | answer_prompt
+        | llm
+        | StrOutputParser()
+    )
+    
+    return qa_chain
+
+def main():
+    st.set_page_config(page_title="PDF RAG Q&A System", layout="wide")
+    
+    st.title("📚 PDF RAG Q&A System with Neo4j")
+    
+    try:
+        # Initialize components
+        graph, llm, vector_index = initialize_components()
+        qa_chain = setup_qa_chain(llm, graph, vector_index)
+        
+        # Sidebar for document loading
+        with st.sidebar:
+            st.header("Upload PDF Documents")
+            uploaded_files = st.file_uploader(
+                "Choose PDF files", 
+                type=['pdf'],
+                accept_multiple_files=True
+            )
+            
+            if uploaded_files:
+                for uploaded_file in uploaded_files:
+                    # Check if file has already been processed
+                    if uploaded_file.name not in st.session_state.processed_files:
+                        with st.spinner(f"Processing {uploaded_file.name}..."):
+                            try:
+                                num_chunks = process_pdf_file(uploaded_file, graph, vector_index)
+                                st.success(f"Successfully processed {uploaded_file.name} into {num_chunks} chunks")
+                                st.session_state.processed_files.add(uploaded_file.name)
+                            except Exception as e:
+                                st.error(f"Error processing {uploaded_file.name}: {str(e)}")
+            
+            # Display processed files
+            if st.session_state.processed_files:
+                st.header("Processed Files")
+                for file in st.session_state.processed_files:
+                    st.text(f"✓ {file}")
+        
+        # Main chat interface
+        st.header("Ask Questions")
+        
+        # Display chat history
+        for message in st.session_state.chat_history:
+            with st.chat_message(message["role"]):
+                st.write(message["content"])
+        
+        # Chat input
+        if question := st.chat_input("Ask a question about the uploaded documents"):
+            # Display user question
+            with st.chat_message("user"):
+                st.write(question)
+            
+            # Add user message to chat history
+            st.session_state.chat_history.append({"role": "user", "content": question})
+            
+            # Generate and display response
+            with st.chat_message("assistant"):
+                with st.spinner("Thinking..."):
+                    try:
+                        response = qa_chain.invoke({"question": question})
+                        st.write(response)
+                        # Add assistant response to chat history
+                        st.session_state.chat_history.append({"role": "assistant", "content": response})
+                    except Exception as e:
+                        st.error(f"Error generating response: {str(e)}")
+    
+    except Exception as e:
+        st.error(f"Error initializing components: {str(e)}")
+        st.error("Please make sure your environment variables are set correctly and Neo4j is running.")
+
+if __name__ == "__main__":
+    main()
